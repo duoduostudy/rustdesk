@@ -17,3 +17,39 @@ jobs:
       upload-artifact: true
       upload-tag: "custom"
     secrets: inherit
+  package-android-apk:
+    needs: build-all
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: librustdesk.so.aarch64-linux-android }
+        continue-on-error: true
+      - run: git clone --recurse-submodules https://github.com/rustdesk/rustdesk.git source
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable, flutter-version: 3.24.5 }
+      - run: |
+          mkdir -p source/flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp librustdesk.so.aarch64-linux-android source/flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so 2>/dev/null || true
+          cd source/flutter
+          flutter build apk --release --split-per-abi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-android-apk
+          path: source/flutter/build/app/outputs/flutter-apk/*.apk
+  create-release:
+    needs: package-android-apk
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: rustdesk-*, merge-multiple: true }
+        continue-on-error: true
+      - name: Create Release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          RELEASE_NAME="rustdesk-$(date +'%Y%m%d')"
+          gh release create "$RELEASE_NAME" *.exe *.msi *.deb *.apk *.dmg \
+            --repo ${{ github.repository }} --title "$RELEASE_NAME" \
+            --notes "Custom build" --prerelease || true
