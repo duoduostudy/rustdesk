@@ -345,7 +345,11 @@ fn check_get_displays_changed_msg() -> Option<Message> {
             // from the DRM display list here. Without this the display service broadcasts an empty
             // list that overwrites the login peer-info displays and the client shows "No displays".
             #[cfg(feature = "drm")]
-            if super::drm_capturer::is_available_cached() {
+            if super::drm_capturer::is_available_cached()
+                // A suppressed lookup skips the turn, keeping the last published geometry
+                // rather than briefly advertising the unaugmented DRM stack.
+                && !scrap::wayland::display::wayland_lookup_suppressed()
+            {
                 if let Some(displays) = super::drm_capturer::get_display_infos() {
                     SYNC_DISPLAYS.lock().unwrap().check_changed(&displays);
                 }

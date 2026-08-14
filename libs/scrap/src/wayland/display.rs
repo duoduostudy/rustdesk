@@ -19,6 +19,15 @@ static MISSING_LOGICAL_SIZE_WARNED: std::sync::atomic::AtomicBool =
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(1000);
 
+// drm builds only: a failed lookup there forks the probe child, and the pollers turn every
+// few hundred milliseconds. Elsewhere a failure is one cheap in-process connect error.
+#[cfg(feature = "drm")]
+const FAILED_LOOKUP_BACKOFF: Duration = Duration::from_secs(5);
+
+// (last failure, invalidation generation) under one lock, so a clear is atomic against lookups.
+#[cfg(feature = "drm")]
+static LAST_FAILED_LOOKUP: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
+
 pub struct Displays {
     pub primary: usize,
     pub displays: Vec<WaylandDisplayInfo>,
@@ -171,11 +180,54 @@ fn get_primary_monitor() -> Option<String> {
         .or_else(try_gdbus_primary)
 }
 
+// Pure, so the backoff policy is testable without a compositor.
+#[cfg(feature = "drm")]
+fn lookup_allowed(failed_at: Option<Instant>, now: Instant, backoff: Duration) -> bool {
+    failed_at.map_or(true, |at| now.saturating_duration_since(at) >= backoff)
+}
+
+#[cfg(feature = "drm")]
+fn backed_off() -> bool {
+    let failed_at = LAST_FAILED_LOOKUP.lock().unwrap().0;
+    !lookup_allowed(failed_at, Instant::now(), FAILED_LOOKUP_BACKOFF)
+}
+
+// Enumerates and keeps the failure stamp current. Suppresses nothing itself: one-shot callers
+// (session init, pipewire) must always get a fresh read, or a transient failure latches.
+fn enumerate_displays() -> hbb_common::ResultType<Vec<WaylandDisplayInfo>> {
+    #[cfg(not(feature = "drm"))]
+    {
+        get_wayland_displays()
+    }
+    #[cfg(feature = "drm")]
+    {
+        let generation = LAST_FAILED_LOOKUP.lock().unwrap().1;
+        let probed = get_wayland_displays();
+        let mut state = LAST_FAILED_LOOKUP.lock().unwrap();
+        // A clear that landed mid-lookup bumped the generation; this answer predates it.
+        if state.1 == generation {
+            state.0 = probed.is_err().then(Instant::now);
+        }
+        probed
+    }
+}
+
+// True when a lookup now could neither hit the cache nor probe. Pollers skip their turn on
+// it and keep their last published state; one-shot callers must not consult it.
+#[cfg(feature = "drm")]
+pub fn wayland_lookup_suppressed() -> bool {
+    let suppressed = DISPLAYS.lock().unwrap().is_none() && backed_off();
+    if suppressed {
+        tracing::debug!("wayland display lookup suppressed during the failure backoff");
+    }
+    suppressed
+}
+
 pub fn get_displays() -> Arc<Displays> {
     let mut lock = DISPLAYS.lock().unwrap();
     match lock.as_ref() {
         Some(displays) => displays.clone(),
-        None => match get_wayland_displays() {
+        None => match enumerate_displays() {
             Ok(displays) => {
                 let mut primary_index = None;
                 if let Some(name) = get_primary_monitor() {
@@ -215,6 +267,13 @@ pub fn get_displays() -> Arc<Displays> {
 #[inline]
 pub fn clear_wayland_displays_cache() {
     let _ = DISPLAYS.lock().unwrap().take();
+    // One critical section: a lookup already out sees the bump and cannot re-arm the stamp.
+    #[cfg(feature = "drm")]
+    {
+        let mut state = LAST_FAILED_LOOKUP.lock().unwrap();
+        state.0 = None;
+        state.1 = state.1.wrapping_add(1);
+    }
 }
 
 // Return (min_x, max_x, min_y, max_y)
@@ -223,12 +282,17 @@ pub fn get_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
     desktop_rect_of(&wayland_displays.displays)
 }
 
-// The desktop rect and per-display logical rects, always read live from the
-// compositor in a single roundtrip. Skips the displays cache and the primary-monitor
-// detection (which may spawn external commands), so it is cheap enough to poll for
-// layout changes. https://github.com/rustdesk/rustdesk/issues/15601
+// The desktop rect and per-display logical rects, read live from the compositor in a
+// single roundtrip (in drm builds the failure backoff may skip a turn). Skips the displays
+// cache and the primary-monitor detection (which may spawn external commands), so it is
+// cheap enough to poll for layout changes. https://github.com/rustdesk/rustdesk/issues/15601
 pub fn get_layout_for_uinput_live() -> Option<((i32, i32, i32, i32), Vec<DisplayRect>)> {
-    match get_wayland_displays() {
+    #[cfg(feature = "drm")]
+    if backed_off() {
+        tracing::debug!("wayland layout lookup suppressed during the failure backoff");
+        return None;
+    }
+    match enumerate_displays() {
         Ok(displays) => {
             desktop_rect_of(&displays).map(|rect| (rect, logical_rects_of(&displays)))
         }
@@ -385,6 +449,50 @@ fn map_axis(v: i32, base_origin: i32, base_extent: i32, live_origin: i32, live_e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn test_lookup_allowed_when_none_has_failed() {
+        assert!(lookup_allowed(None, Instant::now(), FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn test_lookup_waits_out_the_backoff_then_runs_again() {
+        // Future `now`s sidestep Instant subtraction, which can panic near boot.
+        let failed_at = Instant::now();
+        let half = failed_at + FAILED_LOOKUP_BACKOFF / 2;
+        let full = failed_at + FAILED_LOOKUP_BACKOFF;
+        assert!(!lookup_allowed(
+            Some(failed_at),
+            half,
+            FAILED_LOOKUP_BACKOFF
+        ));
+        assert!(lookup_allowed(Some(failed_at), full, FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn test_lookup_stamp_from_the_future_only_waits() {
+        // saturating_duration_since answers zero rather than underflowing.
+        let now = Instant::now();
+        let failed_at = now + FAILED_LOOKUP_BACKOFF;
+        assert!(!lookup_allowed(Some(failed_at), now, FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn test_clear_drops_the_stamp_and_bumps_the_generation() {
+        let generation_before = {
+            let mut state = LAST_FAILED_LOOKUP.lock().unwrap();
+            state.0 = Some(Instant::now());
+            state.1
+        };
+        clear_wayland_displays_cache();
+        let state = LAST_FAILED_LOOKUP.lock().unwrap();
+        assert!(state.0.is_none());
+        assert_eq!(state.1, generation_before.wrapping_add(1));
+    }
 
     fn display(
         x: i32,
